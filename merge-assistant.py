@@ -18,7 +18,11 @@ CHEZMOI_PREFIXES = (
     "modify_", "create_", "empty_", "readonly_"
 )
 
-def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False):
+def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False, binary=False):
+    """
+    Runs a command. 
+    If capture=True, returns stdout (String by default, Bytes if binary=True).
+    """
     try:
         result = subprocess.run(
             cmd, 
@@ -29,7 +33,7 @@ def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False):
             stderr=subprocess.PIPE if capture else None
         )
         if capture:
-            return result.stdout.decode().strip()
+            return result.stdout if binary else result.stdout.decode('utf-8', errors='replace').strip()
     except subprocess.CalledProcessError:
         if not capture and exit_on_fail:
             print(f"\n[!] Error running command: {cmd}")
@@ -66,6 +70,7 @@ def get_commit_hash(path):
 def get_upstream_diffs(repo_path, old_commit, new_commit, inner_path):
     if not old_commit or not new_commit or old_commit == new_commit:
         return []
+    # name-only is safe for file lists
     diff_cmd = f"git diff --name-only {old_commit}..{new_commit}"
     output = run_cmd(diff_cmd, cwd=repo_path, capture=True, exit_on_fail=False)
     if not output: return []
@@ -75,10 +80,9 @@ def get_upstream_diffs(repo_path, old_commit, new_commit, inner_path):
     return files
 
 def get_file_content_at_commit(repo_path, commit, filepath):
-    """Reads a file from a specific git commit."""
+    """Reads a file from a specific git commit as BYTES to handle binaries."""
     try:
-        # git show commit:path
-        return run_cmd(f"git show {commit}:{filepath}", cwd=repo_path, capture=True, exit_on_fail=False)
+        return run_cmd(f"git show {commit}:{filepath}", cwd=repo_path, capture=True, exit_on_fail=False, binary=True)
     except:
         return None
 
@@ -98,7 +102,6 @@ def clean_upstream_path(path, inner_path):
 def find_local_match(source_dir, upstream_file, inner_path):
     """Finds the corresponding local chezmoi file for an upstream path."""
     clean = clean_upstream_path(upstream_file, inner_path)
-    # This is a heuristic. We scan source_dir for a file that normalizes to 'clean'
     for item in source_dir.rglob("*"):
         if item.is_file() and ".git" not in item.parts:
             rel_path = item.relative_to(source_dir)
@@ -107,12 +110,15 @@ def find_local_match(source_dir, upstream_file, inner_path):
                 return str(rel_path)
     return None
 
+def is_binary(content):
+    """Simple heuristic to detect binary content (contains null byte)."""
+    return b'\0' in content if content else False
+
 def show_summary(source_dir, branch_name, upstream_changes, inner_path):
     print("\n" + "="*60)
     print(f"{'ANALYSIS SUMMARY':^60}")
     print("="*60)
     
-    # 1. UPSTREAM NEWS
     if upstream_changes:
         print(f"\n[!] FRESH UPSTREAM UPDATES")
         print(f"    (These files changed in the external repo since your last pull)")
@@ -122,7 +128,6 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
         print(f"\n[i] UPSTREAM STATUS")
         print(f"    No new changes in external repo (or first run).")
 
-    # 2. COLLISION DETECTION
     changes = run_cmd(f"git diff --name-status HEAD..{branch_name}", cwd=source_dir, capture=True)
     added, modified = [], []
     if changes:
@@ -160,12 +165,7 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
     return added, modified
 
 def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit, new_commit, inner_path):
-    """
-    The intelligent merge logic.
-    """
-    if not upstream_changes:
-        print("No upstream changes to process.")
-        return
+    if not upstream_changes: return
 
     print(f"-> Starting Smart Merge for {len(upstream_changes)} updated files...")
     
@@ -176,47 +176,63 @@ def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit
         local_file = find_local_match(source_dir, upstream_file, inner_path)
         
         if not local_file:
-            # It's a brand new file (or we couldn't find a match).
-            # We assume it maps to something standard, but usually this is covered by "Added" logic.
-            # For simplicity in this loop, we skip if we can't find a local equivalent to compare against.
             continue
             
         full_local_path = source_dir / local_file
         
-        # 1. Get Base Content (Old Upstream)
+        # 1. Get Base Content (Old Upstream) - Bytes
         base_content = get_file_content_at_commit(cache_dir / upstream_file.split('/')[0], old_commit, upstream_file)
         
-        # 2. Get Their Content (New Upstream)
-        # We can grab it from the compare branch easily
-        theirs_content = run_cmd(f"git show {branch_name}:{local_file}", cwd=source_dir, capture=True, exit_on_fail=False)
-
-        # 3. Get Your Content (Local File)
+        # 2. Get Their Content (New Upstream) - Bytes
+        # Note: git show <branch>:<file>
         try:
-            with open(full_local_path, 'r') as f:
+            theirs_content = run_cmd(f"git show {branch_name}:{local_file}", cwd=source_dir, capture=True, exit_on_fail=False, binary=True)
+        except:
+            theirs_content = None
+
+        # 3. Get Your Content (Local File) - Bytes
+        try:
+            with open(full_local_path, 'rb') as f:
                 yours_content = f.read()
         except:
             yours_content = None
 
         if base_content is None or theirs_content is None or yours_content is None:
-            # Binary files or errors
             continue
 
         # --- LOGIC GATES ---
-        
+
+        # Binary Safety Check
+        if is_binary(base_content) or is_binary(yours_content) or is_binary(theirs_content):
+             # For binaries, strict equality check
+            if yours_content == base_content:
+                print(f"    [Auto-Update] {local_file} (Binary)")
+                run_cmd(f"git checkout {branch_name} -- {local_file}", cwd=source_dir)
+                processed_count += 1
+            else:
+                print(f"\n    [!] CONFLICT: {local_file} (Binary)")
+                print("        [t]ake theirs")
+                print("        [k]eep yours")
+                if input("        Select action [t/k]: ").strip().lower() == 't':
+                    run_cmd(f"git checkout {branch_name} -- {local_file}", cwd=source_dir)
+                    processed_count += 1
+            continue
+
+        # Text Logic
         # Case A: You haven't touched it (Yours == Base)
+        # We strip whitespace to avoid false conflicts on line endings
         if yours_content.strip() == base_content.strip():
-            # Safe to update!
             print(f"    [Auto-Update] {local_file}")
             run_cmd(f"git checkout {branch_name} -- {local_file}", cwd=source_dir)
             processed_count += 1
             continue
 
-        # Case B: You changed it (Yours != Base) -> CONFLICT
+        # Case B: Conflict
         print(f"\n    [!] CONFLICT: {local_file}")
-        print("        (You changed this file, and upstream updated it)")
-        print("        [t]ake theirs (overwrite your changes)")
+        print("        (Local changes detected)")
+        print("        [t]ake theirs (discard your changes)")
         print("        [k]eep yours (discard upstream update)")
-        print("        [m]erge manually (open editor with conflict markers)")
+        print("        [m]erge (try auto-merge)")
         
         while True:
             choice = input("        Select action [t/k/m]: ").strip().lower()
@@ -232,43 +248,47 @@ def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit
                 break
             
             elif choice == 'm':
-                print("        -> Generating conflict markers...")
+                print("        -> Attempting 3-way merge...")
                 
-                # We need temporary files for git merge-file
-                with tempfile.NamedTemporaryFile(mode='w+', delete=False) as f_base, \
-                     tempfile.NamedTemporaryFile(mode='w+', delete=False) as f_theirs:
+                with tempfile.NamedTemporaryFile(mode='wb', delete=False) as f_base, \
+                     tempfile.NamedTemporaryFile(mode='wb', delete=False) as f_theirs:
                     
                     f_base.write(base_content)
                     f_theirs.write(theirs_content)
-                    
                     f_base_path = f_base.name
                     f_theirs_path = f_theirs.name
 
-                # git merge-file <current> <base> <other>
-                # This modifies <current> in place
+                # Run git merge-file
+                # Return code 0 = Success (clean auto-merge)
+                # Return code >0 = Conflicts (markers added)
+                ret_code = 0
                 try:
-                    subprocess.run(
+                    proc = subprocess.run(
                         ["git", "merge-file", "-L", "current", "-L", "base", "-L", "incoming", str(full_local_path), f_base_path, f_theirs_path],
                         cwd=source_dir
                     )
+                    ret_code = proc.returncode
                 except:
-                    pass
-                
-                # Open Editor
-                editor = os.environ.get('EDITOR', 'nano') # fallback to nano
-                subprocess.call([editor, str(full_local_path)])
+                    print("        [!] Merge tool failed.")
                 
                 # Cleanup temps
                 os.remove(f_base_path)
                 os.remove(f_theirs_path)
+
+                if ret_code == 0:
+                    print("        ✅ Auto-merge successful! (No markers needed)")
+                    # No editor needed, file is updated in place
+                else:
+                    print("        ⚠️  Conflict markers added (<<<<). Please resolve manually.")
+                    editor = os.environ.get('EDITOR', 'nano')
+                    subprocess.call([editor, str(full_local_path)])
                 
                 processed_count += 1
                 conflict_count += 1
                 break
 
-    print(f"\n✅ Smart Merge Complete. Updated {processed_count} files ({conflict_count} manual merges).")
+    print(f"\n✅ Smart Merge Complete. Updated {processed_count} files.")
     
-    # Prompt for final diff check
     print("\n-> Would you like to see the final 'chezmoi diff' (Source vs Home)? (y/n)")
     if input("   > ").strip().lower() == 'y':
         subprocess.run("chezmoi diff", shell=True, cwd=source_dir)
