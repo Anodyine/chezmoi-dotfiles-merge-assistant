@@ -68,32 +68,42 @@ def get_upstream_diffs(submodule_path, old_commit, new_commit, inner_path):
     if not old_commit or not new_commit or old_commit == new_commit:
         return []
     
-    # Get list of changed files
     diff_cmd = f"git diff --name-only {old_commit}..{new_commit}"
     output = run_cmd(diff_cmd, cwd=submodule_path, capture=True, exit_on_fail=False)
     
     if not output: return []
     
     files = output.splitlines()
-    # Filter by inner_path if specified
     if inner_path and inner_path != ".":
         files = [f for f in files if f.startswith(inner_path)]
         
     return files
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="Chezmoi Merge Assistant")
-    parser.add_argument("--repo", "-r", required=True, help="GitHub URL of dotfiles repo")
-    parser.add_argument("--path", "-p", default=".", help="Path inside repo (default: root)")
-    parser.add_argument("--branch", "-b", default=DEFAULT_BRANCH, help="Branch name")
-    return parser.parse_args()
+def normalize_chezmoi_path(path):
+    """
+    Approximates the translation of a chezmoi path back to a standard path 
+    for comparison (e.g., dot_config -> .config).
+    """
+    # Simple heuristic replacement for standard cases
+    p = path.replace("dot_", ".")
+    p = p.replace("private_", "")
+    p = p.replace("executable_", "")
+    p = p.replace("exact_", "")
+    p = p.replace("readonly_", "")
+    return p
 
-def show_summary(source_dir, branch_name, upstream_changes):
+def clean_upstream_path(path, inner_path):
+    """Removes the inner_path prefix from the upstream file."""
+    if inner_path and inner_path != "." and path.startswith(inner_path):
+        return path[len(inner_path):].lstrip("/")
+    return path
+
+def show_summary(source_dir, branch_name, upstream_changes, inner_path):
     print("\n" + "="*60)
     print(f"{'ANALYSIS SUMMARY':^60}")
     print("="*60)
     
-    # 1. Show what happened in the External Repo (The "News Feed")
+    # 1. UPSTREAM NEWS
     if upstream_changes:
         print(f"\n[!] FRESH UPSTREAM UPDATES")
         print(f"    (These files changed in the external repo since your last pull)")
@@ -103,23 +113,20 @@ def show_summary(source_dir, branch_name, upstream_changes):
         print(f"\n[i] UPSTREAM STATUS")
         print(f"    No new changes in external repo (or first run).")
 
-    # 2. Show the Net Result on your config
+    # 2. PR PREVIEW
     changes = run_cmd(f"git diff --name-status HEAD..{branch_name}", cwd=source_dir, capture=True)
     
-    if not changes:
-        print("\n[i] RESULT: No changes to your configuration.")
-        return
-
     added, modified, deleted = [], [], []
-    for line in changes.split('\n'):
-        if not line.strip(): continue
-        parts = line.split(maxsplit=1)
-        if len(parts) < 2: continue
-        status, filename = parts[0], parts[1]
-        
-        if status.startswith('A'): added.append(filename)
-        elif status.startswith('M'): modified.append(filename)
-        elif status.startswith('D'): deleted.append(filename)
+    if changes:
+        for line in changes.split('\n'):
+            if not line.strip(): continue
+            parts = line.split(maxsplit=1)
+            if len(parts) < 2: continue
+            status, filename = parts[0], parts[1]
+            
+            if status.startswith('A'): added.append(filename)
+            elif status.startswith('M'): modified.append(filename)
+            elif status.startswith('D'): deleted.append(filename)
 
     print(f"\n[!] PULL REQUEST PREVIEW")
     print(f"    (Merging the PR will affect these files in your config)")
@@ -127,17 +134,54 @@ def show_summary(source_dir, branch_name, upstream_changes):
     if added:
         print(f"\n    [+] NEW FILES (You don't have these yet):")
         for f in sorted(added): print(f"        {f}")
-        
     if modified:
         print(f"\n    [*] MODIFIED FILES (Content differs):")
         for f in sorted(modified): print(f"        {f}")
-
     if deleted:
         print(f"\n    [-] DELETED FILES (You have these, upstream doesn't):")
         if len(deleted) > 10:
             print(f"        ({len(deleted)} files... usually your custom scripts)")
         else:
             for f in sorted(deleted): print(f"        {f}")
+
+    # 3. COLLISION DETECTION (High Attention)
+    if upstream_changes and modified:
+        collisions = []
+        
+        # Prepare normalized upstream list
+        clean_upstream = [clean_upstream_path(f, inner_path) for f in upstream_changes]
+        
+        for mod_file in modified:
+            # Check if this modified file corresponds to an upstream change
+            norm_mod = normalize_chezmoi_path(mod_file)
+            
+            # Simple suffix match to handle path variances
+            for up_file in clean_upstream:
+                if norm_mod.endswith(up_file) or up_file.endswith(norm_mod):
+                    collisions.append(mod_file)
+                    break
+        
+        if collisions:
+            print("\n" + "*"*60)
+            print("   ATTENTION REQUIRED: MODIFIED LOCALLY & UPDATED UPSTREAM")
+            print("   (You customized these files, and the author just updated them too)")
+            print("*"*60)
+            for f in sorted(collisions):
+                print(f"    !! {f}")
+    
+    # 4. REPEAT LINK
+    remote_url = get_git_remote_url(source_dir)
+    if remote_url:
+        print("\n" + "="*60)
+        print(f"COMPARE HERE: {remote_url}/compare/{branch_name}?expand=1")
+        print("="*60 + "\n")
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description="Chezmoi Merge Assistant")
+    parser.add_argument("--repo", "-r", required=True, help="GitHub URL of dotfiles repo")
+    parser.add_argument("--path", "-p", default=".", help="Path inside repo (default: root)")
+    parser.add_argument("--branch", "-b", default=DEFAULT_BRANCH, help="Branch name")
+    return parser.parse_args()
 
 def main():
     args = parse_arguments()
@@ -164,7 +208,7 @@ def main():
         print(f"\n[!] Error: Cannot use current branch '{current_branch}' as target.")
         sys.exit(1)
 
-    # --- SUBMODULE LOGIC (With State Capture) ---
+    # --- SUBMODULE LOGIC ---
     old_commit = None
     if submodule_full_path.exists():
         old_commit = get_submodule_commit(submodule_full_path)
@@ -173,14 +217,10 @@ def main():
         run_cmd(f"git submodule add --force {args.repo} {submodule_rel_path}", cwd=source_dir)
 
     print(f"-> Updating external repo...")
-    # Update to latest remote
     run_cmd(f"git submodule update --init --recursive --remote {submodule_rel_path}", cwd=source_dir)
     
     new_commit = get_submodule_commit(submodule_full_path)
-    
-    # Calculate what changed upstream
     upstream_changes = get_upstream_diffs(submodule_full_path, old_commit, new_commit, inner_path)
-    # ---------------------------------------------
 
     print(f"-> Creating archive...")
     try:
@@ -208,10 +248,8 @@ def main():
     run_cmd("git add .", cwd=source_dir)
     run_cmd(f"git commit --allow-empty -m 'Import from {args.repo}'", cwd=source_dir, exit_on_fail=False)
     
-    push_success = False
     try:
         run_cmd(f"git push -f origin {args.branch}", cwd=source_dir)
-        push_success = True
     except:
         print("\n[!] Push failed. Set your origin manually.")
 
@@ -222,14 +260,7 @@ def main():
     if external_dir_path.exists():
         shutil.rmtree(external_dir_path, ignore_errors=True)
 
-    # --- SUMMARY DISPLAY ---
-    if push_success:
-        remote_url = get_git_remote_url(source_dir)
-        if remote_url:
-            print("\n" + "="*60)
-            print(f"SUCCESS! Compare here: {remote_url}/compare/{args.branch}?expand=1")
-    
-    show_summary(source_dir, args.branch, upstream_changes)
+    show_summary(source_dir, args.branch, upstream_changes, inner_path)
 
 if __name__ == "__main__":
     main()
