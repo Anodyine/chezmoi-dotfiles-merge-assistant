@@ -1,7 +1,3 @@
-Here is a comprehensive `README.md` for the tool. I have structured it to be accessible for beginners while providing the precise commands needed for the advanced workflows we developed.
-
------
-
 # Chezmoi Merge Assistant 🤝
 
 **A smarter way to merge upstream dotfile updates.**
