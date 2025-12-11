@@ -59,17 +59,17 @@ def get_git_root(path):
         print("[!] Error: Must be run inside a git repository.")
         sys.exit(1)
 
-def get_submodule_commit(path):
-    """Returns the current HEAD commit hash of the submodule."""
+def get_commit_hash(path):
+    """Returns the current HEAD commit hash of a repo."""
     return run_cmd("git rev-parse HEAD", cwd=path, capture=True, exit_on_fail=False)
 
-def get_upstream_diffs(submodule_path, old_commit, new_commit, inner_path):
-    """Returns list of files changed between two commits inside the submodule."""
+def get_upstream_diffs(repo_path, old_commit, new_commit, inner_path):
+    """Returns list of files changed between two commits."""
     if not old_commit or not new_commit or old_commit == new_commit:
         return []
     
     diff_cmd = f"git diff --name-only {old_commit}..{new_commit}"
-    output = run_cmd(diff_cmd, cwd=submodule_path, capture=True, exit_on_fail=False)
+    output = run_cmd(diff_cmd, cwd=repo_path, capture=True, exit_on_fail=False)
     
     if not output: return []
     
@@ -80,11 +80,6 @@ def get_upstream_diffs(submodule_path, old_commit, new_commit, inner_path):
     return files
 
 def normalize_chezmoi_path(path):
-    """
-    Approximates the translation of a chezmoi path back to a standard path 
-    for comparison (e.g., dot_config -> .config).
-    """
-    # Simple heuristic replacement for standard cases
     p = path.replace("dot_", ".")
     p = p.replace("private_", "")
     p = p.replace("executable_", "")
@@ -93,7 +88,6 @@ def normalize_chezmoi_path(path):
     return p
 
 def clean_upstream_path(path, inner_path):
-    """Removes the inner_path prefix from the upstream file."""
     if inner_path and inner_path != "." and path.startswith(inner_path):
         return path[len(inner_path):].lstrip("/")
     return path
@@ -144,18 +138,12 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
         else:
             for f in sorted(deleted): print(f"        {f}")
 
-    # 3. COLLISION DETECTION (High Attention)
+    # 3. COLLISION DETECTION
     if upstream_changes and modified:
         collisions = []
-        
-        # Prepare normalized upstream list
         clean_upstream = [clean_upstream_path(f, inner_path) for f in upstream_changes]
-        
         for mod_file in modified:
-            # Check if this modified file corresponds to an upstream change
             norm_mod = normalize_chezmoi_path(mod_file)
-            
-            # Simple suffix match to handle path variances
             for up_file in clean_upstream:
                 if norm_mod.endswith(up_file) or up_file.endswith(norm_mod):
                     collisions.append(mod_file)
@@ -169,7 +157,6 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
             for f in sorted(collisions):
                 print(f"    !! {f}")
     
-    # 4. REPEAT LINK
     remote_url = get_git_remote_url(source_dir)
     if remote_url:
         print("\n" + "="*60)
@@ -191,16 +178,20 @@ def main():
     script_location = Path(__file__).parent.resolve()
     source_dir = get_git_root(script_location)
     
+    # We clone into .external_sources/repo_name
     repo_name = args.repo.split("/")[-1].replace(".git", "")
-    submodule_rel_path = os.path.join(EXTERNAL_DIR, repo_name)
-    submodule_full_path = source_dir / submodule_rel_path
+    cache_dir = source_dir / EXTERNAL_DIR
+    target_repo_path = cache_dir / repo_name
 
     print(f"--- Chezmoi Merge Assistant ---")
     print(f"Target: {args.repo}")
     print(f"Branch: {args.branch}")
 
+    # 1. Check Clean State (ignoring untracked files in .external_sources if ignored)
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=source_dir):
         print("\n[!] Error: Repo has uncommitted changes. Commit or stash first.")
+        # Tip for the user
+        print(f"    (Make sure '{EXTERNAL_DIR}/' is in your .gitignore)")
         sys.exit(1)
 
     current_branch = get_current_branch(source_dir)
@@ -208,27 +199,33 @@ def main():
         print(f"\n[!] Error: Cannot use current branch '{current_branch}' as target.")
         sys.exit(1)
 
-    # --- SUBMODULE LOGIC ---
+    # 2. CACHE MANAGEMENT (Clone/Update)
+    if not cache_dir.exists():
+        cache_dir.mkdir()
+
     old_commit = None
-    if submodule_full_path.exists():
-        old_commit = get_submodule_commit(submodule_full_path)
+    if target_repo_path.exists():
+        old_commit = get_commit_hash(target_repo_path)
+        print(f"-> Updating external repo cache...")
+        # Reset to ensure clean state for pull
+        run_cmd("git fetch origin", cwd=target_repo_path)
+        run_cmd("git reset --hard origin/HEAD", cwd=target_repo_path)
     else:
-        print(f"\n-> Downloading external repo...")
-        run_cmd(f"git submodule add --force {args.repo} {submodule_rel_path}", cwd=source_dir)
-
-    print(f"-> Updating external repo...")
-    run_cmd(f"git submodule update --init --recursive --remote {submodule_rel_path}", cwd=source_dir)
+        print(f"-> Cloning external repo to cache...")
+        run_cmd(f"git clone {args.repo} {repo_name}", cwd=cache_dir)
     
-    new_commit = get_submodule_commit(submodule_full_path)
-    upstream_changes = get_upstream_diffs(submodule_full_path, old_commit, new_commit, inner_path)
+    new_commit = get_commit_hash(target_repo_path)
+    upstream_changes = get_upstream_diffs(target_repo_path, old_commit, new_commit, inner_path)
 
+    # 3. ARCHIVE
     print(f"-> Creating archive...")
     try:
-        run_cmd(f"git archive --format=tar {git_treeish} > {TEMP_TAR}", cwd=submodule_full_path)
+        run_cmd(f"git archive --format=tar {git_treeish} > {TEMP_TAR}", cwd=target_repo_path)
     except:
         print(f"[!] Error: Path '{inner_path}' not found in external repo.")
         sys.exit(1)
 
+    # 4. BRANCH & CLEAN
     print(f"-> Switching to branch '{args.branch}'...")
     run_cmd(f"git checkout -B {args.branch}", cwd=source_dir)
 
@@ -241,9 +238,11 @@ def main():
             if item.is_dir(): shutil.rmtree(item)
             else: item.unlink()
 
+    # 5. IMPORT
     print("-> Importing via chezmoi...")
     run_cmd(f"chezmoi import --source {source_dir} --destination {Path.home()} {TEMP_TAR}", cwd=source_dir)
 
+    # 6. PUSH
     print("-> Committing and Pushing...")
     run_cmd("git add .", cwd=source_dir)
     run_cmd(f"git commit --allow-empty -m 'Import from {args.repo}'", cwd=source_dir, exit_on_fail=False)
@@ -253,13 +252,12 @@ def main():
     except:
         print("\n[!] Push failed. Set your origin manually.")
 
+    # 7. RESET
     print(f"-> Returning to {current_branch}...")
     run_cmd(f"git checkout {current_branch}", cwd=source_dir)
     
-    external_dir_path = source_dir / EXTERNAL_DIR
-    if external_dir_path.exists():
-        shutil.rmtree(external_dir_path, ignore_errors=True)
-
+    # WE DO NOT DELETE EXTERNAL_DIR HERE. We leave it for the "News Feed" next time.
+    
     show_summary(source_dir, args.branch, upstream_changes, inner_path)
 
 if __name__ == "__main__":
