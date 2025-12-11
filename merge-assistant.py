@@ -4,6 +4,7 @@ import sys
 import shutil
 import subprocess
 import argparse
+import tempfile
 from pathlib import Path
 
 # --- Configuration ---
@@ -19,7 +20,6 @@ CHEZMOI_PREFIXES = (
 
 def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False):
     try:
-        # If capture is True, we don't let stdout go to terminal, we catch it
         result = subprocess.run(
             cmd, 
             shell=True, 
@@ -66,17 +66,21 @@ def get_commit_hash(path):
 def get_upstream_diffs(repo_path, old_commit, new_commit, inner_path):
     if not old_commit or not new_commit or old_commit == new_commit:
         return []
-    
     diff_cmd = f"git diff --name-only {old_commit}..{new_commit}"
     output = run_cmd(diff_cmd, cwd=repo_path, capture=True, exit_on_fail=False)
-    
     if not output: return []
-    
     files = output.splitlines()
     if inner_path and inner_path != ".":
         files = [f for f in files if f.startswith(inner_path)]
-        
     return files
+
+def get_file_content_at_commit(repo_path, commit, filepath):
+    """Reads a file from a specific git commit."""
+    try:
+        # git show commit:path
+        return run_cmd(f"git show {commit}:{filepath}", cwd=repo_path, capture=True, exit_on_fail=False)
+    except:
+        return None
 
 def normalize_chezmoi_path(path):
     p = path.replace("dot_", ".")
@@ -90,6 +94,18 @@ def clean_upstream_path(path, inner_path):
     if inner_path and inner_path != "." and path.startswith(inner_path):
         return path[len(inner_path):].lstrip("/")
     return path
+
+def find_local_match(source_dir, upstream_file, inner_path):
+    """Finds the corresponding local chezmoi file for an upstream path."""
+    clean = clean_upstream_path(upstream_file, inner_path)
+    # This is a heuristic. We scan source_dir for a file that normalizes to 'clean'
+    for item in source_dir.rglob("*"):
+        if item.is_file() and ".git" not in item.parts:
+            rel_path = item.relative_to(source_dir)
+            norm = normalize_chezmoi_path(str(rel_path))
+            if norm.endswith(clean):
+                return str(rel_path)
+    return None
 
 def show_summary(source_dir, branch_name, upstream_changes, inner_path):
     print("\n" + "="*60)
@@ -106,40 +122,20 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
         print(f"\n[i] UPSTREAM STATUS")
         print(f"    No new changes in external repo (or first run).")
 
-    # 2. PR PREVIEW
+    # 2. COLLISION DETECTION
     changes = run_cmd(f"git diff --name-status HEAD..{branch_name}", cwd=source_dir, capture=True)
-    
-    added, modified, deleted = [], [], []
+    added, modified = [], []
     if changes:
         for line in changes.split('\n'):
             if not line.strip(): continue
             parts = line.split(maxsplit=1)
             if len(parts) < 2: continue
             status, filename = parts[0], parts[1]
-            
             if status.startswith('A'): added.append(filename)
             elif status.startswith('M'): modified.append(filename)
-            elif status.startswith('D'): deleted.append(filename)
 
-    print(f"\n[!] PULL REQUEST PREVIEW")
-    print(f"    (Merging the PR will affect these files in your config)")
-    
-    if added:
-        print(f"\n    [+] NEW FILES (You don't have these yet):")
-        for f in sorted(added): print(f"        {f}")
-    if modified:
-        print(f"\n    [*] MODIFIED FILES (Content differs):")
-        for f in sorted(modified): print(f"        {f}")
-    if deleted:
-        print(f"\n    [-] DELETED FILES (You have these, upstream doesn't):")
-        if len(deleted) > 10:
-            print(f"        ({len(deleted)} files... usually your custom scripts)")
-        else:
-            for f in sorted(deleted): print(f"        {f}")
-
-    # 3. COLLISION DETECTION
+    collisions = []
     if upstream_changes and modified:
-        collisions = []
         clean_upstream = [clean_upstream_path(f, inner_path) for f in upstream_changes]
         for mod_file in modified:
             norm_mod = normalize_chezmoi_path(mod_file)
@@ -151,7 +147,6 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
         if collisions:
             print("\n" + "*"*60)
             print("   ATTENTION REQUIRED: MODIFIED LOCALLY & UPDATED UPSTREAM")
-            print("   (You customized these files, and the author just updated them too)")
             print("*"*60)
             for f in sorted(collisions):
                 print(f"    !! {f}")
@@ -164,56 +159,119 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
     
     return added, modified
 
-def prompt_auto_merge(source_dir, branch_name, added, modified):
+def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit, new_commit, inner_path):
     """
-    Prompts the user to accept changes. 
-    If yes, checks out the Modified and Added files (skipping Deleted).
-    Then runs chezmoi diff to show the result.
+    The intelligent merge logic.
     """
-    total_updates = len(added) + len(modified)
-    if total_updates == 0:
-        print("No upstream updates to merge.")
+    if not upstream_changes:
+        print("No upstream changes to process.")
         return
 
-    print(f"-> Would you like to overwrite your local files with these {total_updates} upstream changes? (y/N)")
-    print("   (This will NOT delete your local-only files, only update common ones)")
+    print(f"-> Starting Smart Merge for {len(upstream_changes)} updated files...")
     
-    choice = input("   > ").strip().lower()
-    if choice == 'y':
-        print("\n-> Applying updates...")
-        
-        # We only checkout Added and Modified. We ignore Deleted to protect user customizations.
-        files_to_update = added + modified
-        
-        # Git checkout supports multiple files. passing as list argument avoids shell injection
-        cmd = ["git", "checkout", branch_name, "--"] + files_to_update
-        
-        try:
-            subprocess.run(cmd, cwd=source_dir, check=True)
-            print(f"✅ Successfully updated {len(files_to_update)} files.")
-        except subprocess.CalledProcessError:
-            print("[!] Error updating files.")
-            return
+    processed_count = 0
+    conflict_count = 0
 
-        print("\n" + "="*60)
-        print(f"{'SOURCE OF TRUTH CHECK':^60}")
-        print("="*60)
-        print("Running 'chezmoi diff' to compare the NEW source against your ACTIVE config...")
-        print("RED   = Customizations you just lost (Re-add these manually!)")
-        print("GREEN = New upstream features")
-        print("-" * 60)
+    for upstream_file in upstream_changes:
+        local_file = find_local_match(source_dir, upstream_file, inner_path)
         
-        # Run chezmoi diff directly to stdout
+        if not local_file:
+            # It's a brand new file (or we couldn't find a match).
+            # We assume it maps to something standard, but usually this is covered by "Added" logic.
+            # For simplicity in this loop, we skip if we can't find a local equivalent to compare against.
+            continue
+            
+        full_local_path = source_dir / local_file
+        
+        # 1. Get Base Content (Old Upstream)
+        base_content = get_file_content_at_commit(cache_dir / upstream_file.split('/')[0], old_commit, upstream_file)
+        
+        # 2. Get Their Content (New Upstream)
+        # We can grab it from the compare branch easily
+        theirs_content = run_cmd(f"git show {branch_name}:{local_file}", cwd=source_dir, capture=True, exit_on_fail=False)
+
+        # 3. Get Your Content (Local File)
+        try:
+            with open(full_local_path, 'r') as f:
+                yours_content = f.read()
+        except:
+            yours_content = None
+
+        if base_content is None or theirs_content is None or yours_content is None:
+            # Binary files or errors
+            continue
+
+        # --- LOGIC GATES ---
+        
+        # Case A: You haven't touched it (Yours == Base)
+        if yours_content.strip() == base_content.strip():
+            # Safe to update!
+            print(f"    [Auto-Update] {local_file}")
+            run_cmd(f"git checkout {branch_name} -- {local_file}", cwd=source_dir)
+            processed_count += 1
+            continue
+
+        # Case B: You changed it (Yours != Base) -> CONFLICT
+        print(f"\n    [!] CONFLICT: {local_file}")
+        print("        (You changed this file, and upstream updated it)")
+        print("        [t]ake theirs (overwrite your changes)")
+        print("        [k]eep yours (discard upstream update)")
+        print("        [m]erge manually (open editor with conflict markers)")
+        
+        while True:
+            choice = input("        Select action [t/k/m]: ").strip().lower()
+            
+            if choice == 'k':
+                print("        -> Keeping local version.")
+                break
+            
+            elif choice == 't':
+                print("        -> Overwriting with upstream.")
+                run_cmd(f"git checkout {branch_name} -- {local_file}", cwd=source_dir)
+                processed_count += 1
+                break
+            
+            elif choice == 'm':
+                print("        -> Generating conflict markers...")
+                
+                # We need temporary files for git merge-file
+                with tempfile.NamedTemporaryFile(mode='w+', delete=False) as f_base, \
+                     tempfile.NamedTemporaryFile(mode='w+', delete=False) as f_theirs:
+                    
+                    f_base.write(base_content)
+                    f_theirs.write(theirs_content)
+                    
+                    f_base_path = f_base.name
+                    f_theirs_path = f_theirs.name
+
+                # git merge-file <current> <base> <other>
+                # This modifies <current> in place
+                try:
+                    subprocess.run(
+                        ["git", "merge-file", "-L", "current", "-L", "base", "-L", "incoming", str(full_local_path), f_base_path, f_theirs_path],
+                        cwd=source_dir
+                    )
+                except:
+                    pass
+                
+                # Open Editor
+                editor = os.environ.get('EDITOR', 'nano') # fallback to nano
+                subprocess.call([editor, str(full_local_path)])
+                
+                # Cleanup temps
+                os.remove(f_base_path)
+                os.remove(f_theirs_path)
+                
+                processed_count += 1
+                conflict_count += 1
+                break
+
+    print(f"\n✅ Smart Merge Complete. Updated {processed_count} files ({conflict_count} manual merges).")
+    
+    # Prompt for final diff check
+    print("\n-> Would you like to see the final 'chezmoi diff' (Source vs Home)? (y/n)")
+    if input("   > ").strip().lower() == 'y':
         subprocess.run("chezmoi diff", shell=True, cwd=source_dir)
-        
-        print("\n" + "="*60)
-        print("NEXT STEPS:")
-        print("1. If you saw RED lines above, edit those files to re-apply your tweaks.")
-        print("2. Run 'chezmoi diff' again to verify.")
-        print("3. When happy, run 'chezmoi apply' and 'git push'.")
-    else:
-        print("\n-> Merge skipped. You can manually cherry-pick files using:")
-        print(f"   git checkout {branch_name} -- <filename>")
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Chezmoi Merge Assistant")
@@ -240,17 +298,9 @@ def main():
 
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=source_dir):
         print("\n[!] Error: Repo has uncommitted changes. Commit or stash first.")
-        print(f"    (Make sure '{EXTERNAL_DIR}/' is in your .gitignore)")
         sys.exit(1)
 
-    current_branch = get_current_branch(source_dir)
-    if args.branch == current_branch:
-        print(f"\n[!] Error: Cannot use current branch '{current_branch}' as target.")
-        sys.exit(1)
-
-    # CACHE
-    if not cache_dir.exists():
-        cache_dir.mkdir()
+    if not cache_dir.exists(): cache_dir.mkdir()
 
     old_commit = None
     if target_repo_path.exists():
@@ -265,7 +315,6 @@ def main():
     new_commit = get_commit_hash(target_repo_path)
     upstream_changes = get_upstream_diffs(target_repo_path, old_commit, new_commit, inner_path)
 
-    # ARCHIVE
     print(f"-> Creating archive...")
     try:
         run_cmd(f"git archive --format=tar {git_treeish} > {TEMP_TAR}", cwd=target_repo_path)
@@ -273,7 +322,6 @@ def main():
         print(f"[!] Error: Path '{inner_path}' not found in external repo.")
         sys.exit(1)
 
-    # BRANCH & CLEAN
     print(f"-> Switching to branch '{args.branch}'...")
     run_cmd(f"git checkout -B {args.branch}", cwd=source_dir)
 
@@ -281,32 +329,34 @@ def main():
     for item in source_dir.iterdir():
         if item.name == ".git" or item.name == EXTERNAL_DIR: continue
         if item == script_location or script_location.is_relative_to(item): continue
-
         if item.name.startswith(CHEZMOI_PREFIXES):
             if item.is_dir(): shutil.rmtree(item)
             else: item.unlink()
 
-    # IMPORT
     print("-> Importing via chezmoi...")
     run_cmd(f"chezmoi import --source {source_dir} --destination {Path.home()} {TEMP_TAR}", cwd=source_dir)
 
-    # PUSH
     print("-> Committing and Pushing...")
     run_cmd("git add .", cwd=source_dir)
     run_cmd(f"git commit --allow-empty -m 'Import from {args.repo}'", cwd=source_dir, exit_on_fail=False)
-    
     try:
         run_cmd(f"git push -f origin {args.branch}", cwd=source_dir)
     except:
-        print("\n[!] Push failed. Set your origin manually.")
+        pass
 
-    # RESET
+    current_branch = get_current_branch(source_dir)
     print(f"-> Returning to {current_branch}...")
-    run_cmd(f"git checkout {current_branch}", cwd=source_dir)
+    run_cmd(f"git checkout -", cwd=source_dir) # Go back to original branch
     
-    # SUMMARY & PROMPT
+    # Show analysis
     added, modified = show_summary(source_dir, args.branch, upstream_changes, inner_path)
-    prompt_auto_merge(source_dir, args.branch, added, modified)
+
+    # Prompt for Smart Merge
+    if upstream_changes:
+        print(f"\n-> Found {len(upstream_changes)} files changed upstream.")
+        print(f"   Would you like to run the Smart Merge wizard? (y/n)")
+        if input("   > ").strip().lower() == 'y':
+            smart_merge(source_dir, target_repo_path, args.branch, upstream_changes, old_commit, new_commit, inner_path)
 
 if __name__ == "__main__":
     main()
