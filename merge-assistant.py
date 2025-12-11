@@ -18,10 +18,14 @@ CHEZMOI_PREFIXES = (
 )
 
 def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False, binary=False):
+    """
+    Runs a command. Handles both string (shell=True) and list (shell=False) inputs.
+    """
+    use_shell = isinstance(cmd, str)
     try:
         result = subprocess.run(
             cmd, 
-            shell=True, 
+            shell=use_shell, 
             check=True, 
             cwd=cwd, 
             stdout=subprocess.PIPE if capture else None,
@@ -31,7 +35,8 @@ def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False, binary=False):
             return result.stdout if binary else result.stdout.decode('utf-8', errors='replace').strip()
     except subprocess.CalledProcessError:
         if not capture and exit_on_fail:
-            print(f"\n[!] Error running command: {cmd}")
+            cmd_str = cmd if use_shell else " ".join(cmd)
+            print(f"\n[!] Error running command: {cmd_str}")
             sys.exit(1)
         return None
 
@@ -105,6 +110,23 @@ def find_local_match(source_dir, upstream_file, inner_path):
 def is_binary(content):
     return b'\0' in content if content else False
 
+def print_diff(label, content_a, content_b):
+    print(f"\n--- {label} ---")
+    try:
+        a_str = content_a.decode('utf-8').splitlines(keepends=True)
+        b_str = content_b.decode('utf-8').splitlines(keepends=True)
+        import difflib
+        diff = difflib.unified_diff(a_str, b_str, fromfile="Base", tofile="New", n=0)
+        has_output = False
+        for line in diff:
+            has_output = True
+            if line.startswith('+'): print(f"\033[32m{line.strip()}\033[0m")
+            elif line.startswith('-'): print(f"\033[31m{line.strip()}\033[0m")
+            elif line.startswith('@'): print(f"\033[36m{line.strip()}\033[0m")
+        if not has_output: print("(No text changes detected)")
+    except:
+        print("(Diff unavailable - encoding issue)")
+
 def show_summary(source_dir, branch_name, upstream_changes, inner_path):
     print("\n" + "="*60)
     print(f"{'ANALYSIS SUMMARY':^60}")
@@ -152,99 +174,70 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
         print("\n" + "="*60)
         print(f"COMPARE HERE: {remote_url}/compare/{branch_name}?expand=1")
         print("="*60 + "\n")
-    
-    return added, modified
-
-def print_diff(label, content_a, content_b, is_binary_file):
-    if is_binary_file:
-        print(f"\n--- {label} (Binary file changed) ---")
-        return
-
-    print(f"\n--- {label} ---")
-    # Decode bytes to string for diffing
-    try:
-        a_str = content_a.decode('utf-8').splitlines(keepends=True)
-        b_str = content_b.decode('utf-8').splitlines(keepends=True)
-        
-        import difflib
-        # Using unified_diff to generate git-like output
-        diff = difflib.unified_diff(a_str, b_str, fromfile="Base", tofile="New", n=0)
-        
-        has_output = False
-        for line in diff:
-            has_output = True
-            if line.startswith('+'):
-                print(f"\033[32m{line.strip()}\033[0m") # Green
-            elif line.startswith('-'):
-                print(f"\033[31m{line.strip()}\033[0m") # Red
-            elif line.startswith('@'):
-                print(f"\033[36m{line.strip()}\033[0m") # Cyan
-        
-        if not has_output:
-            print("(No text changes detected)")
-
-    except Exception:
-        print("(Unable to display diff - likely binary or encoding issue)")
-
 
 def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit, new_commit, inner_path):
     if not upstream_changes: return
 
-    # Pre-scan to separate Auto-Merge from Conflicts
     auto_merge_list = []
     conflict_list = []
 
     print("-> Analyzing changes...")
-
     for upstream_file in upstream_changes:
         local_file = find_local_match(source_dir, upstream_file, inner_path)
         if not local_file: continue
         
         full_local_path = source_dir / local_file
         
-        # 1. Get Base (Old Upstream)
+        # 1. Base (Old Upstream)
         base_content = get_file_content_at_commit(cache_dir / upstream_file.split('/')[0], old_commit, upstream_file)
-        # 2. Get Yours (Local)
+        # 2. Yours (Local)
         try:
             with open(full_local_path, 'rb') as f: yours_content = f.read()
         except: yours_content = None
-        # 3. Get Theirs (New Upstream)
+        # 3. Theirs (New Upstream)
         try:
             theirs_content = run_cmd(f"git show {branch_name}:{local_file}", cwd=source_dir, capture=True, exit_on_fail=False, binary=True)
         except: theirs_content = None
 
         if base_content is None or yours_content is None or theirs_content is None: continue
 
-        # Check binary
         is_bin = is_binary(base_content) or is_binary(yours_content) or is_binary(theirs_content)
 
-        # Logic: If Yours == Base, it's clean.
-        if not is_bin and yours_content.strip() == base_content.strip():
-            auto_merge_list.append((local_file, upstream_file))
-        elif is_bin and yours_content == base_content:
-             auto_merge_list.append((local_file, upstream_file))
+        if not is_bin:
+            # Match stripped content to avoid whitespace conflicts
+            yours_strip = yours_content.strip()
+            base_strip = base_content.strip()
+            theirs_strip = theirs_content.strip()
+            
+            if yours_strip == theirs_strip:
+                print(f"    [Skipped] {local_file} (Already up to date)")
+                continue
+            elif yours_strip == base_strip:
+                auto_merge_list.append((local_file, upstream_file))
+            else:
+                conflict_list.append({'local': local_file, 'base': base_content, 'yours': yours_content, 'theirs': theirs_content, 'is_bin': False})
         else:
-            conflict_list.append({
-                'local': local_file,
-                'base': base_content,
-                'yours': yours_content,
-                'theirs': theirs_content,
-                'is_bin': is_bin
-            })
+            # Binary strict check
+            if yours_content == theirs_content:
+                print(f"    [Skipped] {local_file} (Already up to date)")
+                continue
+            elif yours_content == base_content:
+                auto_merge_list.append((local_file, upstream_file))
+            else:
+                conflict_list.append({'local': local_file, 'base': base_content, 'yours': yours_content, 'theirs': theirs_content, 'is_bin': True})
 
-    # --- ACTION PHASE ---
-
-    # 1. Auto-Updates
+    # ACTION: Auto-Updates
     if auto_merge_list:
         print(f"\n-> Automatically updating {len(auto_merge_list)} files from upstream...")
         files_to_checkout = [x[0] for x in auto_merge_list]
+        # FIX: Pass as list to avoid shell injection and git error
         run_cmd(["git", "checkout", branch_name, "--"] + files_to_checkout, cwd=source_dir)
         for f, _ in auto_merge_list:
             print(f"    [Updated] {f}")
 
-    # 2. Conflicts
+    # ACTION: Conflicts
     if not conflict_list:
-        print("\n✅ All upstream changes merged successfully!")
+        print("\n✅ All upstream changes processed successfully!")
         return
 
     print(f"\n-> Found {len(conflict_list)} files with conflicts.")
@@ -259,45 +252,34 @@ def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit
         print(f"CONFLICT: {local_file}")
         print("*"*60)
 
-        # Print Visual Diffs
         if not item['is_bin']:
-            print_diff("YOUR CHANGES (Local vs Base)", item['base'], item['yours'], False)
-            print_diff("THEIR CHANGES (Upstream vs Base)", item['base'], item['theirs'], False)
+            print_diff("YOUR CHANGES (Local vs Base)", item['base'], item['yours'])
+            print_diff("THEIR CHANGES (Upstream vs Base)", item['base'], item['theirs'])
         else:
             print("[Binary file - diff unavailable]")
 
-        print("\nOptions:")
-        print("  [t]ake theirs (discard your changes)")
-        print("  [k]eep yours  (discard upstream update)")
-        print("  [m]erge       (try auto-merge)")
-        
+        print("\nOptions: [t]ake theirs, [k]eep yours, [m]erge")
         while True:
             choice = input("  Select action [t/k/m]: ").strip().lower()
-            
             if choice == 'k':
                 print("  -> Keeping local version.")
                 break
-            
             elif choice == 't':
                 print("  -> Overwriting with upstream.")
-                run_cmd(f"git checkout {branch_name} -- {local_file}", cwd=source_dir)
+                run_cmd(["git", "checkout", branch_name, "--", local_file], cwd=source_dir)
                 processed += 1
                 break
-            
             elif choice == 'm':
                 if item['is_bin']:
-                    print("  [!] Cannot auto-merge binary files. Please choose t or k.")
+                    print("  [!] Cannot auto-merge binary. Choose t or k.")
                     continue
-
-                print("  -> Attempting 3-way merge...")
                 
+                print("  -> Attempting 3-way merge...")
                 with tempfile.NamedTemporaryFile(mode='wb', delete=False) as f_base, \
                      tempfile.NamedTemporaryFile(mode='wb', delete=False) as f_theirs:
-                    
                     f_base.write(item['base'])
                     f_theirs.write(item['theirs'])
-                    f_base_path = f_base.name
-                    f_theirs_path = f_theirs.name
+                    f_base_path, f_theirs_path = f_base.name, f_theirs.name
 
                 ret_code = 0
                 try:
@@ -313,12 +295,11 @@ def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit
                 os.remove(f_theirs_path)
 
                 if ret_code == 0:
-                    print("  ✅ Auto-merge successful!")
+                    print("  ✅ Auto-merge successful! (No markers needed)")
                 else:
                     print("  ⚠️  Conflict markers added. Opening editor...")
                     editor = os.environ.get('EDITOR', 'nano')
                     subprocess.call([editor, str(source_dir / local_file)])
-                
                 processed += 1
                 break
 
