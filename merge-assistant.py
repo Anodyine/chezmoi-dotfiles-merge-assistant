@@ -4,7 +4,6 @@ import sys
 import shutil
 import subprocess
 import argparse
-import re
 from pathlib import Path
 
 # --- Configuration ---
@@ -30,7 +29,7 @@ def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False):
         )
         if capture:
             return result.stdout.decode().strip()
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError:
         if not capture:
             print(f"\n[!] Error running command: {cmd}")
         if exit_on_fail: sys.exit(1)
@@ -40,11 +39,8 @@ def get_current_branch(cwd):
     return run_cmd("git branch --show-current", cwd=cwd, capture=True)
 
 def get_git_remote_url(cwd):
-    """Gets the origin remote URL to generate the PR link."""
     url = run_cmd("git remote get-url origin", cwd=cwd, capture=True)
     if not url: return None
-    
-    # Convert SSH (git@github.com:User/Repo.git) to HTTPS (https://github.com/User/Repo)
     if url.startswith("git@"):
         url = url.replace(":", "/").replace("git@", "https://")
     if url.endswith(".git"):
@@ -53,18 +49,37 @@ def get_git_remote_url(cwd):
 
 def get_git_root(path):
     try:
-        # Check if inside a submodule
         super_root = subprocess.check_output(
             ["git", "rev-parse", "--show-superproject-working-tree"], 
             cwd=path, stderr=subprocess.DEVNULL
         ).decode().strip()
         if super_root: return Path(super_root)
-        
-        # Normal repo root
         return Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], cwd=path).decode().strip())
     except:
         print("[!] Error: Must be run inside a git repository.")
         sys.exit(1)
+
+def get_submodule_commit(path):
+    """Returns the current HEAD commit hash of the submodule."""
+    return run_cmd("git rev-parse HEAD", cwd=path, capture=True, exit_on_fail=False)
+
+def get_upstream_diffs(submodule_path, old_commit, new_commit, inner_path):
+    """Returns list of files changed between two commits inside the submodule."""
+    if not old_commit or not new_commit or old_commit == new_commit:
+        return []
+    
+    # Get list of changed files
+    diff_cmd = f"git diff --name-only {old_commit}..{new_commit}"
+    output = run_cmd(diff_cmd, cwd=submodule_path, capture=True, exit_on_fail=False)
+    
+    if not output: return []
+    
+    files = output.splitlines()
+    # Filter by inner_path if specified
+    if inner_path and inner_path != ".":
+        files = [f for f in files if f.startswith(inner_path)]
+        
+    return files
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Chezmoi Merge Assistant")
@@ -73,59 +88,56 @@ def parse_arguments():
     parser.add_argument("--branch", "-b", default=DEFAULT_BRANCH, help="Branch name")
     return parser.parse_args()
 
-def show_summary(source_dir, branch_name):
-    """Analyzes the changes between the previous branch and the comparison branch."""
-    print("\n" + "="*40)
-    print("       COMPARISON SUMMARY")
-    print("="*40)
+def show_summary(source_dir, branch_name, upstream_changes):
+    print("\n" + "="*60)
+    print(f"{'ANALYSIS SUMMARY':^60}")
+    print("="*60)
     
-    # We are currently on the previous branch (e.g. main). 
-    # We want to see what 'branch_name' has that we don't, or what is different.
-    
-    # Get the list of changed files
-    # --name-status gives us: 'M file', 'A file', 'D file'
-    # We compare HEAD (main) vs branch_name
+    # 1. Show what happened in the External Repo (The "News Feed")
+    if upstream_changes:
+        print(f"\n[!] FRESH UPSTREAM UPDATES")
+        print(f"    (These files changed in the external repo since your last pull)")
+        for f in sorted(upstream_changes):
+            print(f"    * {f}")
+    else:
+        print(f"\n[i] UPSTREAM STATUS")
+        print(f"    No new changes in external repo (or first run).")
+
+    # 2. Show the Net Result on your config
     changes = run_cmd(f"git diff --name-status HEAD..{branch_name}", cwd=source_dir, capture=True)
     
     if not changes:
-        print("No changes detected.")
+        print("\n[i] RESULT: No changes to your configuration.")
         return
 
-    added = []
-    modified = []
-    deleted = []
-
+    added, modified, deleted = [], [], []
     for line in changes.split('\n'):
         if not line.strip(): continue
         parts = line.split(maxsplit=1)
         if len(parts) < 2: continue
-        
         status, filename = parts[0], parts[1]
-        
-        # In git diff HEAD..BRANCH:
-        # A (Added) means the BRANCH has it, HEAD doesn't. (New upstream file)
-        # D (Deleted) means HEAD has it, BRANCH doesn't. (You have a file they don't)
-        # M (Modified) means both have it, but content differs.
         
         if status.startswith('A'): added.append(filename)
         elif status.startswith('M'): modified.append(filename)
         elif status.startswith('D'): deleted.append(filename)
 
+    print(f"\n[!] PULL REQUEST PREVIEW")
+    print(f"    (Merging the PR will affect these files in your config)")
+    
     if added:
-        print(f"\n[+] NEW FILES (Upstream has these, you don't):")
-        for f in sorted(added): print(f"    {f}")
+        print(f"\n    [+] NEW FILES (You don't have these yet):")
+        for f in sorted(added): print(f"        {f}")
         
     if modified:
-        print(f"\n[*] MODIFIED FILES (Content differs):")
-        for f in sorted(modified): print(f"    {f}")
+        print(f"\n    [*] MODIFIED FILES (Content differs):")
+        for f in sorted(modified): print(f"        {f}")
 
     if deleted:
-        print(f"\n[-] DELETED FILES (You have these, upstream doesn't):")
-        # Optional: Print only the first few if there are many
+        print(f"\n    [-] DELETED FILES (You have these, upstream doesn't):")
         if len(deleted) > 10:
-            print(f"    ({len(deleted)} files... usually your custom scripts or private keys)")
+            print(f"        ({len(deleted)} files... usually your custom scripts)")
         else:
-            for f in sorted(deleted): print(f"    {f}")
+            for f in sorted(deleted): print(f"        {f}")
 
 def main():
     args = parse_arguments()
@@ -140,42 +152,46 @@ def main():
     submodule_full_path = source_dir / submodule_rel_path
 
     print(f"--- Chezmoi Merge Assistant ---")
-    print(f"User Repo: {source_dir}")
-    print(f"Target:    {args.repo}")
-    print(f"Branch:    {args.branch}")
+    print(f"Target: {args.repo}")
+    print(f"Branch: {args.branch}")
 
-    # 1. Check Clean State
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=source_dir):
         print("\n[!] Error: Repo has uncommitted changes. Commit or stash first.")
         sys.exit(1)
 
-    # 2. Safety Check
     current_branch = get_current_branch(source_dir)
     if args.branch == current_branch:
         print(f"\n[!] Error: Cannot use current branch '{current_branch}' as target.")
         sys.exit(1)
 
-    # 3. Add/Update Submodule
-    if not submodule_full_path.exists():
+    # --- SUBMODULE LOGIC (With State Capture) ---
+    old_commit = None
+    if submodule_full_path.exists():
+        old_commit = get_submodule_commit(submodule_full_path)
+    else:
         print(f"\n-> Downloading external repo...")
         run_cmd(f"git submodule add --force {args.repo} {submodule_rel_path}", cwd=source_dir)
-    else:
-        print(f"\n-> Updating external repo...")
-        run_cmd(f"git submodule update --init --recursive --remote {submodule_rel_path}", cwd=source_dir)
 
-    # 4. Archive
-    print(f"\n-> Creating archive...")
+    print(f"-> Updating external repo...")
+    # Update to latest remote
+    run_cmd(f"git submodule update --init --recursive --remote {submodule_rel_path}", cwd=source_dir)
+    
+    new_commit = get_submodule_commit(submodule_full_path)
+    
+    # Calculate what changed upstream
+    upstream_changes = get_upstream_diffs(submodule_full_path, old_commit, new_commit, inner_path)
+    # ---------------------------------------------
+
+    print(f"-> Creating archive...")
     try:
         run_cmd(f"git archive --format=tar {git_treeish} > {TEMP_TAR}", cwd=submodule_full_path)
     except:
         print(f"[!] Error: Path '{inner_path}' not found in external repo.")
         sys.exit(1)
 
-    # 5. Switch Branch
-    print(f"\n-> Switching to branch '{args.branch}'...")
+    print(f"-> Switching to branch '{args.branch}'...")
     run_cmd(f"git checkout -B {args.branch}", cwd=source_dir)
 
-    # 6. Clean Configuration
     print("-> Cleaning old config files...")
     for item in source_dir.iterdir():
         if item.name == ".git" or item.name == EXTERNAL_DIR: continue
@@ -185,11 +201,9 @@ def main():
             if item.is_dir(): shutil.rmtree(item)
             else: item.unlink()
 
-    # 7. Import
     print("-> Importing via chezmoi...")
     run_cmd(f"chezmoi import --source {source_dir} --destination {Path.home()} {TEMP_TAR}", cwd=source_dir)
 
-    # 8. Commit & Push
     print("-> Committing and Pushing...")
     run_cmd("git add .", cwd=source_dir)
     run_cmd(f"git commit --allow-empty -m 'Import from {args.repo}'", cwd=source_dir, exit_on_fail=False)
@@ -201,24 +215,21 @@ def main():
     except:
         print("\n[!] Push failed. Set your origin manually.")
 
-    # 9. Reset & Cleanup
-    print(f"\n-> Returning to {current_branch}...")
+    print(f"-> Returning to {current_branch}...")
     run_cmd(f"git checkout {current_branch}", cwd=source_dir)
     
     external_dir_path = source_dir / EXTERNAL_DIR
     if external_dir_path.exists():
-        # Clean up safely
         shutil.rmtree(external_dir_path, ignore_errors=True)
 
-    # 10. Summary & Links
+    # --- SUMMARY DISPLAY ---
     if push_success:
         remote_url = get_git_remote_url(source_dir)
         if remote_url:
-            print("\nSUCCESS!")
-            print(f"Compare here: {remote_url}/compare/{args.branch}?expand=1")
+            print("\n" + "="*60)
+            print(f"SUCCESS! Compare here: {remote_url}/compare/{args.branch}?expand=1")
     
-    # Show the file analysis
-    show_summary(source_dir, args.branch)
+    show_summary(source_dir, args.branch, upstream_changes)
 
 if __name__ == "__main__":
     main()
