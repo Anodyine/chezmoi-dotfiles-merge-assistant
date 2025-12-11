@@ -19,6 +19,7 @@ CHEZMOI_PREFIXES = (
 
 def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False):
     try:
+        # If capture is True, we don't let stdout go to terminal, we catch it
         result = subprocess.run(
             cmd, 
             shell=True, 
@@ -30,9 +31,9 @@ def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False):
         if capture:
             return result.stdout.decode().strip()
     except subprocess.CalledProcessError:
-        if not capture:
+        if not capture and exit_on_fail:
             print(f"\n[!] Error running command: {cmd}")
-        if exit_on_fail: sys.exit(1)
+            sys.exit(1)
         return None
 
 def get_current_branch(cwd):
@@ -60,11 +61,9 @@ def get_git_root(path):
         sys.exit(1)
 
 def get_commit_hash(path):
-    """Returns the current HEAD commit hash of a repo."""
     return run_cmd("git rev-parse HEAD", cwd=path, capture=True, exit_on_fail=False)
 
 def get_upstream_diffs(repo_path, old_commit, new_commit, inner_path):
-    """Returns list of files changed between two commits."""
     if not old_commit or not new_commit or old_commit == new_commit:
         return []
     
@@ -162,6 +161,59 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
         print("\n" + "="*60)
         print(f"COMPARE HERE: {remote_url}/compare/{branch_name}?expand=1")
         print("="*60 + "\n")
+    
+    return added, modified
+
+def prompt_auto_merge(source_dir, branch_name, added, modified):
+    """
+    Prompts the user to accept changes. 
+    If yes, checks out the Modified and Added files (skipping Deleted).
+    Then runs chezmoi diff to show the result.
+    """
+    total_updates = len(added) + len(modified)
+    if total_updates == 0:
+        print("No upstream updates to merge.")
+        return
+
+    print(f"-> Would you like to overwrite your local files with these {total_updates} upstream changes? (y/N)")
+    print("   (This will NOT delete your local-only files, only update common ones)")
+    
+    choice = input("   > ").strip().lower()
+    if choice == 'y':
+        print("\n-> Applying updates...")
+        
+        # We only checkout Added and Modified. We ignore Deleted to protect user customizations.
+        files_to_update = added + modified
+        
+        # Git checkout supports multiple files. passing as list argument avoids shell injection
+        cmd = ["git", "checkout", branch_name, "--"] + files_to_update
+        
+        try:
+            subprocess.run(cmd, cwd=source_dir, check=True)
+            print(f"✅ Successfully updated {len(files_to_update)} files.")
+        except subprocess.CalledProcessError:
+            print("[!] Error updating files.")
+            return
+
+        print("\n" + "="*60)
+        print(f"{'SOURCE OF TRUTH CHECK':^60}")
+        print("="*60)
+        print("Running 'chezmoi diff' to compare the NEW source against your ACTIVE config...")
+        print("RED   = Customizations you just lost (Re-add these manually!)")
+        print("GREEN = New upstream features")
+        print("-" * 60)
+        
+        # Run chezmoi diff directly to stdout
+        subprocess.run("chezmoi diff", shell=True, cwd=source_dir)
+        
+        print("\n" + "="*60)
+        print("NEXT STEPS:")
+        print("1. If you saw RED lines above, edit those files to re-apply your tweaks.")
+        print("2. Run 'chezmoi diff' again to verify.")
+        print("3. When happy, run 'chezmoi apply' and 'git push'.")
+    else:
+        print("\n-> Merge skipped. You can manually cherry-pick files using:")
+        print(f"   git checkout {branch_name} -- <filename>")
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Chezmoi Merge Assistant")
@@ -178,7 +230,6 @@ def main():
     script_location = Path(__file__).parent.resolve()
     source_dir = get_git_root(script_location)
     
-    # We clone into .external_sources/repo_name
     repo_name = args.repo.split("/")[-1].replace(".git", "")
     cache_dir = source_dir / EXTERNAL_DIR
     target_repo_path = cache_dir / repo_name
@@ -187,10 +238,8 @@ def main():
     print(f"Target: {args.repo}")
     print(f"Branch: {args.branch}")
 
-    # 1. Check Clean State (ignoring untracked files in .external_sources if ignored)
     if subprocess.check_output(["git", "status", "--porcelain"], cwd=source_dir):
         print("\n[!] Error: Repo has uncommitted changes. Commit or stash first.")
-        # Tip for the user
         print(f"    (Make sure '{EXTERNAL_DIR}/' is in your .gitignore)")
         sys.exit(1)
 
@@ -199,7 +248,7 @@ def main():
         print(f"\n[!] Error: Cannot use current branch '{current_branch}' as target.")
         sys.exit(1)
 
-    # 2. CACHE MANAGEMENT (Clone/Update)
+    # CACHE
     if not cache_dir.exists():
         cache_dir.mkdir()
 
@@ -207,7 +256,6 @@ def main():
     if target_repo_path.exists():
         old_commit = get_commit_hash(target_repo_path)
         print(f"-> Updating external repo cache...")
-        # Reset to ensure clean state for pull
         run_cmd("git fetch origin", cwd=target_repo_path)
         run_cmd("git reset --hard origin/HEAD", cwd=target_repo_path)
     else:
@@ -217,7 +265,7 @@ def main():
     new_commit = get_commit_hash(target_repo_path)
     upstream_changes = get_upstream_diffs(target_repo_path, old_commit, new_commit, inner_path)
 
-    # 3. ARCHIVE
+    # ARCHIVE
     print(f"-> Creating archive...")
     try:
         run_cmd(f"git archive --format=tar {git_treeish} > {TEMP_TAR}", cwd=target_repo_path)
@@ -225,7 +273,7 @@ def main():
         print(f"[!] Error: Path '{inner_path}' not found in external repo.")
         sys.exit(1)
 
-    # 4. BRANCH & CLEAN
+    # BRANCH & CLEAN
     print(f"-> Switching to branch '{args.branch}'...")
     run_cmd(f"git checkout -B {args.branch}", cwd=source_dir)
 
@@ -238,11 +286,11 @@ def main():
             if item.is_dir(): shutil.rmtree(item)
             else: item.unlink()
 
-    # 5. IMPORT
+    # IMPORT
     print("-> Importing via chezmoi...")
     run_cmd(f"chezmoi import --source {source_dir} --destination {Path.home()} {TEMP_TAR}", cwd=source_dir)
 
-    # 6. PUSH
+    # PUSH
     print("-> Committing and Pushing...")
     run_cmd("git add .", cwd=source_dir)
     run_cmd(f"git commit --allow-empty -m 'Import from {args.repo}'", cwd=source_dir, exit_on_fail=False)
@@ -252,13 +300,13 @@ def main():
     except:
         print("\n[!] Push failed. Set your origin manually.")
 
-    # 7. RESET
+    # RESET
     print(f"-> Returning to {current_branch}...")
     run_cmd(f"git checkout {current_branch}", cwd=source_dir)
     
-    # WE DO NOT DELETE EXTERNAL_DIR HERE. We leave it for the "News Feed" next time.
-    
-    show_summary(source_dir, args.branch, upstream_changes, inner_path)
+    # SUMMARY & PROMPT
+    added, modified = show_summary(source_dir, args.branch, upstream_changes, inner_path)
+    prompt_auto_merge(source_dir, args.branch, added, modified)
 
 if __name__ == "__main__":
     main()
