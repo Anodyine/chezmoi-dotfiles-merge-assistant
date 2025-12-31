@@ -54,11 +54,21 @@ def get_commit_hash(path):
     return run_cmd("git rev-parse HEAD", cwd=path, capture=True, exit_on_fail=False)
 
 def get_upstream_diffs(repo_path, old_commit, new_commit, inner_path):
-    if not old_commit or not new_commit or old_commit == new_commit:
+    # FIX: If we have a new commit but no old one, treat all files as "changed"
+    if not new_commit:
         return []
-    diff_cmd = f"git diff --name-only {old_commit}..{new_commit}"
-    output = run_cmd(diff_cmd, cwd=repo_path, capture=True, exit_on_fail=False)
+    
+    if not old_commit or old_commit == new_commit:
+        # Get list of all files currently in the repo at this path
+        cmd = f"git ls-tree -r --name-only {new_commit}"
+        output = run_cmd(cmd, cwd=repo_path, capture=True, exit_on_fail=False)
+    else:
+        # Standard diff between two points
+        diff_cmd = f"git diff --name-only {old_commit}..{new_commit}"
+        output = run_cmd(diff_cmd, cwd=repo_path, capture=True, exit_on_fail=False)
+
     if not output: return []
+    
     files = output.splitlines()
     if inner_path and inner_path != ".":
         files = [f for f in files if f.startswith(inner_path)]
