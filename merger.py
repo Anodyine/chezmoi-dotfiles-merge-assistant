@@ -11,13 +11,17 @@ import utils
 import paths
 
 def is_binary(content):
-    return b'\0' in content if content else False
+    if content is None: return False
+    return b'\0' in content
 
 def print_diff(label, content_a, content_b):
     print(f"\n--- {label} ---")
+    # Convert None to empty bytes for the diff engine
+    a = content_a if content_a is not None else b""
+    b = content_b if content_b is not None else b""
     try:
-        a_str = content_a.decode('utf-8').splitlines(keepends=True)
-        b_str = content_b.decode('utf-8').splitlines(keepends=True)
+        a_str = a.decode('utf-8').splitlines(keepends=True)
+        b_str = b.decode('utf-8').splitlines(keepends=True)
         diff = difflib.unified_diff(a_str, b_str, fromfile="Base", tofile="New", n=0)
         has_output = False
         for line in diff:
@@ -27,7 +31,7 @@ def print_diff(label, content_a, content_b):
             elif line.startswith('@'): print(f"\033[36m{line.strip()}\033[0m")
         if not has_output: print("(No text changes detected)")
     except Exception:
-        print("(Diff unavailable - encoding issue)")
+        print("(Diff unavailable - likely binary or encoding issue)")
 
 def show_summary(source_dir, branch_name, upstream_changes, inner_path):
     print("\n" + "="*60)
@@ -35,90 +39,53 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
     print("="*60)
     
     if upstream_changes:
-        print(f"\n[!] FRESH UPSTREAM UPDATES")
-        print(f"    (These files changed in the external repo since your last pull)")
-        for f in sorted(upstream_changes):
+        print(f"\n[!] FRESH UPSTREAM UPDATES ({len(upstream_changes)} files)")
+        # Show first 10 files if list is huge
+        for f in sorted(upstream_changes)[:10]:
             print(f"    * {f}")
+        if len(upstream_changes) > 10:
+            print(f"    ... and {len(upstream_changes)-10} more.")
     else:
-        print(f"\n[i] UPSTREAM STATUS")
-        print(f"    No new changes in external repo (or first run).")
-
-    changes = utils.run_cmd(f"git diff --name-status HEAD..{branch_name}", cwd=source_dir, capture=True)
-    added, modified = [], []
-    if changes:
-        for line in changes.split('\n'):
-            if not line.strip(): continue
-            parts = line.split(maxsplit=1)
-            if len(parts) < 2: continue
-            status, filename = parts[0], parts[1]
-            if status.startswith('A'): added.append(filename)
-            elif status.startswith('M'): modified.append(filename)
-
-    collisions = []
-    if upstream_changes and modified:
-        clean_upstream = [paths.clean_upstream_path(f, inner_path) for f in upstream_changes]
-        for mod_file in modified:
-            norm_mod = paths.normalize_chezmoi_path(mod_file)
-            for up_file in clean_upstream:
-                if norm_mod.endswith(up_file) or up_file.endswith(norm_mod):
-                    collisions.append(mod_file)
-                    break
-        
-        if collisions:
-            print("\n" + "*"*60)
-            print("   ATTENTION REQUIRED: MODIFIED LOCALLY & UPDATED UPSTREAM")
-            print("*"*60)
-            for f in sorted(collisions):
-                print(f"    !! {f}")
-    
-    remote_url = utils.get_git_remote_url(source_dir)
-    if remote_url:
-        print("\n" + "="*60)
-        print(f"COMPARE HERE: {remote_url}/compare/{branch_name}?expand=1")
-        print("="*60 + "\n")
+        print(f"\n[i] UPSTREAM STATUS: No new changes.")
 
 def smart_merge(source_dir, cache_repo_path, branch_name, upstream_changes, old_commit, new_commit, inner_path):
     if not upstream_changes: return
 
     auto_merge_list, conflict_list = [], []
 
-    print("-> Analyzing changes...")
+    print(f"-> Analyzing {len(upstream_changes)} potential changes...")
     for upstream_file in upstream_changes:
         local_file = paths.find_local_match(source_dir, upstream_file, inner_path)
         if not local_file: continue
         
         full_local_path = source_dir / local_file
         
-        # FIX: We now use the full upstream path relative to the cache root
-        # instead of trying to split the directory name.
-        base_content = utils.get_file_content_at_commit(cache_repo_path, old_commit, upstream_file)
-        theirs_content = utils.get_file_content_at_commit(cache_repo_path, new_commit, upstream_file)
+        # Fetching with safety: if file doesn't exist in that commit, return b""
+        base_content = utils.get_file_content_at_commit(cache_repo_path, old_commit, upstream_file) or b""
+        theirs_content = utils.get_file_content_at_commit(cache_repo_path, new_commit, upstream_file) or b""
         
         try:
             with open(full_local_path, 'rb') as f: yours_content = f.read()
-        except: yours_content = None
+        except: yours_content = b""
 
-        if base_content is None or theirs_content is None or yours_content is None:
-            # If we can't find the base (likely a brand new file), we treat it as a conflict to be safe
-            if base_content is None: base_content = b""
-            else: continue
-
-        # Standard normalization for comparison
         is_bin = is_binary(base_content) or is_binary(yours_content) or is_binary(theirs_content)
         
-        # Logic for determining auto-merge vs conflict...
         if not is_bin:
+            # Strip to avoid whitespace-only noise
             y_s, b_s, t_s = yours_content.strip(), base_content.strip(), theirs_content.strip()
-            if y_s == t_s: continue
-            elif y_s == b_s: auto_merge_list.append((local_file, upstream_file))
+            
+            if y_s == t_s: continue # Local already matches new upstream
+            elif y_s == b_s: 
+                # Local matches OLD upstream, so we can safely auto-update to NEW upstream
+                auto_merge_list.append((local_file, upstream_file))
             else:
+                # Both sides differ from base
                 conflict_list.append({'local': local_file, 'base': base_content, 'yours': yours_content, 'theirs': theirs_content, 'is_bin': False})
         else:
             if yours_content == theirs_content: continue
             elif yours_content == base_content: auto_merge_list.append((local_file, upstream_file))
             else:
                 conflict_list.append({'local': local_file, 'base': base_content, 'yours': yours_content, 'theirs': theirs_content, 'is_bin': True})
-
     # ACTION: Auto-Updates
     if auto_merge_list:
         print(f"\n-> Automatically updating {len(auto_merge_list)} files from upstream...")

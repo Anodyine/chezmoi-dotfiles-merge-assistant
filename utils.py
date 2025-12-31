@@ -75,7 +75,9 @@ def get_upstream_diffs(repo_path, old_commit, new_commit, inner_path):
     return files
 
 def get_file_content_at_commit(repo_path, commit, filepath):
+    if not commit: return b""
     try:
+        # Use run_cmd with binary=True and exit_on_fail=False
         return run_cmd(f"git show {commit}:{filepath}", cwd=repo_path, capture=True, exit_on_fail=False, binary=True)
-    except:
-        return None
+    except Exception:
+        return b""
