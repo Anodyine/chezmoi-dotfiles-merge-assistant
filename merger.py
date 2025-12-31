@@ -80,8 +80,7 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
 def smart_merge(source_dir, cache_repo_path, branch_name, upstream_changes, old_commit, new_commit, inner_path):
     if not upstream_changes: return
 
-    auto_merge_list = []
-    conflict_list = []
+    auto_merge_list, conflict_list = [], []
 
     print("-> Analyzing changes...")
     for upstream_file in upstream_changes:
@@ -90,43 +89,33 @@ def smart_merge(source_dir, cache_repo_path, branch_name, upstream_changes, old_
         
         full_local_path = source_dir / local_file
         
-        # 1. Base (Old Upstream) - From cache
+        # FIX: We now use the full upstream path relative to the cache root
+        # instead of trying to split the directory name.
         base_content = utils.get_file_content_at_commit(cache_repo_path, old_commit, upstream_file)
+        theirs_content = utils.get_file_content_at_commit(cache_repo_path, new_commit, upstream_file)
         
-        # 2. Yours (Local) - Current working tree
         try:
             with open(full_local_path, 'rb') as f: yours_content = f.read()
         except: yours_content = None
-        
-        # 3. Theirs (New Upstream) - From cache at NEW commit
-        # FIX: Previously this was pulling from the branch, which already matched 'Base' after import.
-        theirs_content = utils.get_file_content_at_commit(cache_repo_path, new_commit, upstream_file)
 
-        if base_content is None or yours_content is None or theirs_content is None: 
-            continue
+        if base_content is None or theirs_content is None or yours_content is None:
+            # If we can't find the base (likely a brand new file), we treat it as a conflict to be safe
+            if base_content is None: base_content = b""
+            else: continue
 
+        # Standard normalization for comparison
         is_bin = is_binary(base_content) or is_binary(yours_content) or is_binary(theirs_content)
-
+        
+        # Logic for determining auto-merge vs conflict...
         if not is_bin:
-            yours_strip = yours_content.strip()
-            base_strip = base_content.strip()
-            theirs_strip = theirs_content.strip()
-            
-            if yours_strip == theirs_strip:
-                print(f"    [Skipped] {local_file} (Already up to date)")
-                continue
-            elif yours_strip == base_strip:
-                # You haven't touched it, but they did.
-                auto_merge_list.append((local_file, upstream_file))
+            y_s, b_s, t_s = yours_content.strip(), base_content.strip(), theirs_content.strip()
+            if y_s == t_s: continue
+            elif y_s == b_s: auto_merge_list.append((local_file, upstream_file))
             else:
-                # Both sides touched it.
                 conflict_list.append({'local': local_file, 'base': base_content, 'yours': yours_content, 'theirs': theirs_content, 'is_bin': False})
         else:
-            if yours_content == theirs_content:
-                print(f"    [Skipped] {local_file} (Already up to date)")
-                continue
-            elif yours_content == base_content:
-                auto_merge_list.append((local_file, upstream_file))
+            if yours_content == theirs_content: continue
+            elif yours_content == base_content: auto_merge_list.append((local_file, upstream_file))
             else:
                 conflict_list.append({'local': local_file, 'base': base_content, 'yours': yours_content, 'theirs': theirs_content, 'is_bin': True})
 

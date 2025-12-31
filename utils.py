@@ -4,9 +4,6 @@ import subprocess
 from pathlib import Path
 
 def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False, binary=False):
-    """
-    Runs a command. Handles both string (shell=True) and list (shell=False) inputs.
-    """
     use_shell = isinstance(cmd, str)
     try:
         result = subprocess.run(
@@ -18,11 +15,14 @@ def run_cmd(cmd, cwd=None, exit_on_fail=True, capture=False, binary=False):
             stderr=subprocess.PIPE if capture else None
         )
         if capture:
-            return result.stdout if binary else result.stdout.decode('utf-8', errors='replace').strip()
+            # FIX: Only strip if it's text and NOT for file content
+            content = result.stdout
+            if not binary:
+                return content.decode('utf-8', errors='replace')
+            return content
     except subprocess.CalledProcessError:
         if not capture and exit_on_fail:
-            cmd_str = cmd if use_shell else " ".join(cmd)
-            print(f"\n[!] Error running command: {cmd_str}")
+            print(f"\n[!] Error running command: {cmd}")
             sys.exit(1)
         return None
 
