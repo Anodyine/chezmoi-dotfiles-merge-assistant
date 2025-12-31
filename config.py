@@ -1,8 +1,11 @@
-# config.py
+# tools/merge/config.py
 
 DEFAULT_BRANCH = "compare-external"
 EXTERNAL_DIR = ".external_sources"
 TEMP_TAR = "/tmp/incoming_dots.tar"
+
+# Add this line:
+STATE_FILE = ".last_external_commit"
 
 CHEZMOI_PREFIXES = (
     "dot_", "private_", "executable_", "exact_", "symlink_", 
