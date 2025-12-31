@@ -26,7 +26,7 @@ def print_diff(label, content_a, content_b):
             elif line.startswith('-'): print(f"\033[31m{line.strip()}\033[0m")
             elif line.startswith('@'): print(f"\033[36m{line.strip()}\033[0m")
         if not has_output: print("(No text changes detected)")
-    except:
+    except Exception:
         print("(Diff unavailable - encoding issue)")
 
 def show_summary(source_dir, branch_name, upstream_changes, inner_path):
@@ -77,7 +77,7 @@ def show_summary(source_dir, branch_name, upstream_changes, inner_path):
         print(f"COMPARE HERE: {remote_url}/compare/{branch_name}?expand=1")
         print("="*60 + "\n")
 
-def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit, new_commit, inner_path):
+def smart_merge(source_dir, cache_repo_path, branch_name, upstream_changes, old_commit, new_commit, inner_path):
     if not upstream_changes: return
 
     auto_merge_list = []
@@ -90,23 +90,24 @@ def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit
         
         full_local_path = source_dir / local_file
         
-        # 1. Base (Old Upstream)
-        base_content = utils.get_file_content_at_commit(cache_dir / upstream_file.split('/')[0], old_commit, upstream_file)
-        # 2. Yours (Local)
+        # 1. Base (Old Upstream) - From cache
+        base_content = utils.get_file_content_at_commit(cache_repo_path, old_commit, upstream_file)
+        
+        # 2. Yours (Local) - Current working tree
         try:
             with open(full_local_path, 'rb') as f: yours_content = f.read()
         except: yours_content = None
-        # 3. Theirs (New Upstream)
-        try:
-            theirs_content = utils.run_cmd(f"git show {branch_name}:{local_file}", cwd=source_dir, capture=True, exit_on_fail=False, binary=True)
-        except: theirs_content = None
+        
+        # 3. Theirs (New Upstream) - From cache at NEW commit
+        # FIX: Previously this was pulling from the branch, which already matched 'Base' after import.
+        theirs_content = utils.get_file_content_at_commit(cache_repo_path, new_commit, upstream_file)
 
-        if base_content is None or yours_content is None or theirs_content is None: continue
+        if base_content is None or yours_content is None or theirs_content is None: 
+            continue
 
         is_bin = is_binary(base_content) or is_binary(yours_content) or is_binary(theirs_content)
 
         if not is_bin:
-            # Match stripped content to avoid whitespace conflicts
             yours_strip = yours_content.strip()
             base_strip = base_content.strip()
             theirs_strip = theirs_content.strip()
@@ -115,11 +116,12 @@ def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit
                 print(f"    [Skipped] {local_file} (Already up to date)")
                 continue
             elif yours_strip == base_strip:
+                # You haven't touched it, but they did.
                 auto_merge_list.append((local_file, upstream_file))
             else:
+                # Both sides touched it.
                 conflict_list.append({'local': local_file, 'base': base_content, 'yours': yours_content, 'theirs': theirs_content, 'is_bin': False})
         else:
-            # Binary strict check
             if yours_content == theirs_content:
                 print(f"    [Skipped] {local_file} (Already up to date)")
                 continue
@@ -189,7 +191,7 @@ def smart_merge(source_dir, cache_dir, branch_name, upstream_changes, old_commit
                         cwd=source_dir, stdout=subprocess.DEVNULL
                     )
                     ret_code = proc.returncode
-                except:
+                except Exception:
                     print("  [!] Merge failed.")
                 
                 os.remove(f_base_path)

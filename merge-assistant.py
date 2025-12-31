@@ -107,7 +107,10 @@ def main():
         print(f"   Would you like to run the Smart Merge wizard? (y/n)")
         if input("   > ").strip().lower() == 'y':
             merger.smart_merge(source_dir, target_repo_path, args.branch, upstream_changes, old_commit, new_commit, inner_path)
+            state_file_path.write_text(new_commit)
+            print(f"-> State updated to {new_commit[:8]}")
     else:
+        state_file_path.write_text(new_commit)
         print("\n✅ No upstream changes to merge.")
 
 if __name__ == "__main__":
